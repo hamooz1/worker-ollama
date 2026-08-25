@@ -49,7 +49,7 @@
     }
   ],
   "config": {
-    "gpuTypeId": "NVIDIA GeForce RTX 5090",
+    "gpuTypeId": "NVIDIA A40",
     "gpuCount": 1,
     "env": [
       {
