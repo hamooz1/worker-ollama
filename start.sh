@@ -21,7 +21,8 @@ echo "Ollama server is ready"
 
 if [ -n "$OLLAMA_MODEL" ]; then
     echo "Pulling model: $OLLAMA_MODEL"
-    if ollama pull "$OLLAMA_MODEL"; then
+    # ensure_model uses HF_TOKEN for gated hf.co models, ollama pull otherwise
+    if /opt/venv/bin/python -c 'import os, handler; handler.ensure_model(os.environ["OLLAMA_MODEL"])'; then
         echo "Model pulled: $OLLAMA_MODEL"
     else
         echo "WARN: startup pull of $OLLAMA_MODEL failed — handler will retry on first request"

@@ -20,6 +20,16 @@
         }
       },
       {
+        "key": "HF_TOKEN",
+        "input": {
+          "name": "Hugging Face Token",
+          "type": "string",
+          "description": "Hugging Face access token, required only for gated or private GGUF models (e.g. 'hf.co/google/gemma-3-27b-it-qat-q4_0-gguf:Q4_0'). Leave empty for public models.",
+          "default": "",
+          "advanced": true
+        }
+      },
+      {
         "key": "OLLAMA_CONTEXT_LENGTH",
         "input": {
           "name": "Context Length",
