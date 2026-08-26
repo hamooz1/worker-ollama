@@ -15,7 +15,7 @@
         "input": {
           "name": "Hugging Face GGUF Repo",
           "type": "huggingface",
-          "description": "Hugging Face repo containing GGUF files, e.g. 'unsloth/Qwen3-8B-GGUF'. NOT the same field as 'Model': 'Model' takes an Ollama model name, this takes a Hugging Face repo id. When both are set, this one wins and 'Model' is ignored. Must be a GGUF repo -- safetensors-only repos are rejected with an error. Set the endpoint's Model field to this same repo so Runpod's model store pre-downloads it for free.",
+          "description": "Hugging Face repo containing GGUF files, e.g. 'unsloth/Qwen3-8B-GGUF'. A 'hf.co/<org>/<repo>' form, a full huggingface.co URL, and a trailing ':<quant>' tag are all accepted and normalised. NOT the same field as 'Model': 'Model' takes an Ollama model name, this takes a Hugging Face repo id. When both are set, this one wins and 'Model' is ignored. Must be a GGUF repo -- safetensors-only repos are rejected with an error. Set the endpoint's Model field to this same repo so Runpod's model store pre-downloads it for free.",
           "default": "",
           "advanced": false
         }
@@ -25,7 +25,7 @@
         "input": {
           "name": "Quantization",
           "type": "string",
-          "description": "Which GGUF quantization to load from the Hugging Face repo, e.g. 'Q4_K_M', 'Q8_0', 'IQ4_XS', 'BF16'. Optional: when left empty the smallest GGUF in the repo is used, which is the fastest to load but the lowest quality. Set it explicitly to control quality and VRAM use. Ignored unless 'Hugging Face GGUF Repo' is set.",
+          "description": "Which GGUF quantization to load from the Hugging Face repo, e.g. 'Q4_K_M', 'Q8_0', 'IQ4_XS', 'BF16'. Optional: when left empty, a ':<quant>' tag on the repo above is used if present, otherwise the smallest GGUF in the repo, which is the fastest to load but the lowest quality. Set it explicitly to control quality and VRAM use. Ignored unless 'Hugging Face GGUF Repo' is set.",
           "default": "",
           "advanced": false
         }

@@ -39,10 +39,13 @@ case "$VOLUME_STATE" in
         ;;
 esac
 
+# Note this only reports that the directory exists. It may be Runpod's prefill or
+# this worker's own fallback downloads, which use the same layout. The per-model
+# "[ModelStore] Using snapshot" line is the authoritative signal.
 if [ -d "$RUNPOD_MODEL_CACHE_DIR" ]; then
-    echo "Model store: $RUNPOD_MODEL_CACHE_DIR present (Runpod pre-downloaded cache)"
+    echo "HF cache dir present: $RUNPOD_MODEL_CACHE_DIR (Runpod prefill and/or previous downloads)"
 else
-    echo "Model store: $RUNPOD_MODEL_CACHE_DIR not found — set the endpoint's Model field to a Hugging Face repo to use it"
+    echo "HF cache dir absent: $RUNPOD_MODEL_CACHE_DIR — set the endpoint's Model field to a Hugging Face repo to use Runpod's model store"
 fi
 
 # Ollama's own store: everything it pulls lands here, including plain Ollama

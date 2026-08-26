@@ -271,6 +271,50 @@ def test_derive_model_name_is_lowercase():
 # --- normalize_model_name -----------------------------------------------------
 
 
+# --- parse_hf_model: every shape HF_MODEL arrives in --------------------------
+
+
+@pytest.mark.parametrize(
+    "given, repo, quant",
+    [
+        # what the Hub's Hugging Face picker stores
+        ("hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF", "ornith-ai/Ornith-1.5-35B-A3B-GGUF", ""),
+        # a bare repo id
+        ("unsloth/Qwen3-8B-GGUF", "unsloth/Qwen3-8B-GGUF", ""),
+        # the other host alias
+        ("huggingface.co/unsloth/Qwen3-8B-GGUF", "unsloth/Qwen3-8B-GGUF", ""),
+        # pasted browser URLs, with and without a path suffix
+        ("https://huggingface.co/unsloth/Qwen3-8B-GGUF", "unsloth/Qwen3-8B-GGUF", ""),
+        ("https://huggingface.co/unsloth/Qwen3-8B-GGUF/tree/main", "unsloth/Qwen3-8B-GGUF", ""),
+        ("https://hf.co/unsloth/Qwen3-8B-GGUF", "unsloth/Qwen3-8B-GGUF", ""),
+        # Ollama-style ':quant' tag carries the quantization
+        ("hf.co/unsloth/Qwen3-8B-GGUF:Q4_K_M", "unsloth/Qwen3-8B-GGUF", "Q4_K_M"),
+        ("unsloth/Qwen3-8B-GGUF:IQ4_XS", "unsloth/Qwen3-8B-GGUF", "IQ4_XS"),
+        # ':latest' is not a quantization
+        ("hf.co/unsloth/Qwen3-8B-GGUF:latest", "unsloth/Qwen3-8B-GGUF", ""),
+        # whitespace, trailing slash, host casing
+        ("  hf.co/unsloth/Qwen3-8B-GGUF/  ", "unsloth/Qwen3-8B-GGUF", ""),
+        ("HF.CO/unsloth/Qwen3-8B-GGUF", "unsloth/Qwen3-8B-GGUF", ""),
+        ("", "", ""),
+    ],
+)
+def test_parse_hf_model(given, repo, quant):
+    assert handler.parse_hf_model(given) == (repo, quant)
+
+
+def test_parsed_repo_builds_the_model_store_folder():
+    """The whole point: a wrong repo id means a silent model-store cache miss."""
+    repo, _ = handler.parse_hf_model("hf.co/ornith-ai/Ornith-1.5-35B-A3B-GGUF")
+    assert "models--" + repo.replace("/", "--") == "models--ornith-ai--Ornith-1.5-35B-A3B-GGUF"
+
+
+def test_explicit_quantization_beats_a_tag_in_the_ref(monkeypatch):
+    """HF_QUANTIZATION is the documented input; the ':tag' is only a fallback."""
+    repo, tag = handler.parse_hf_model("hf.co/unsloth/Qwen3-8B-GGUF:Q2_K")
+    assert ("Q8_0" or tag) == "Q8_0"  # mirrors `HF_QUANTIZATION_RAW or _HF_MODEL_TAG`
+    assert tag == "Q2_K"
+
+
 # --- resolve_default_model: the precedence chain ------------------------------
 
 
