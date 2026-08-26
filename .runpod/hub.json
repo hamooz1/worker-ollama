@@ -6,7 +6,7 @@
   "iconUrl": "https://ollama.com/public/ollama.png",
   "config": {
     "runsOn": "GPU",
-    "containerDiskInGb": 50,
+    "containerDiskInGb": 100,
     "gpuIds": "ADA_24",
     "gpuCount": 1,
     "env": [

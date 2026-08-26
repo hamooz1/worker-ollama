@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import uuid
 
 import requests
 import runpod
@@ -33,6 +35,16 @@ FALLBACK_MODEL = "llama3.2:3b"
 QUANT_RE = re.compile(
     r"(?:^|[-_./])(I?Q\d+(?:_[A-Za-z0-9]+)*|BF16|F16|F32|MXFP4)(?=[-./]|$)", re.I
 )
+# GGUFs that live in a model repo but carry no language-model weights. A
+# multimodal projector is the classic case: it ships alongside the model and is
+# usually the *smallest* file in the repo, so a naive "smallest wins" default
+# picks it and every request then fails with an immediate 400.
+NON_MODEL_GGUF_RE = re.compile(r"(?:^|[-_.])(mmproj|mm-proj|projector)", re.I)
+# Ollama's own default when a Hugging Face reference carries no tag, and the
+# quantization model cards assume. Preferred over "smallest" because large repos
+# start at 1-bit quants: unsloth/Qwen3-8B-GGUF's smallest is UD-IQ1_S (2.3 GB)
+# against Q4_K_M's 5.0 GB, and IQ1 output quality is not usable for most work.
+PREFERRED_QUANT = "Q4_K_M"
 # Mirrors Ollama's own splitGGUFNameRe. Matching a different pattern than the
 # server does is how you end up with a silently broken multi-layer manifest.
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
@@ -83,6 +95,153 @@ def parse_hf_model(value):
 # works as well as a bare repo id. An explicit HF_QUANTIZATION still wins.
 HF_MODEL, _HF_MODEL_TAG = parse_hf_model(HF_MODEL_RAW)
 HF_QUANTIZATION = HF_QUANTIZATION_RAW or _HF_MODEL_TAG
+
+
+def free_bytes(path):
+    """Free space on the filesystem holding `path`, walking up to the nearest
+    existing ancestor so it works before the directory is created."""
+    while path and not os.path.exists(path):
+        parent = os.path.dirname(path)
+        if parent == path:
+            break
+        path = parent
+    stat = os.statvfs(path or "/")
+    return stat.f_bavail * stat.f_frsize
+
+
+def require_free_space(path, needed, what):
+    """Fail before doing 20 GiB of I/O that can only end in ENOSPC.
+
+    Ollama re-writes a GGUF when registering it, so a plain import needs about
+    twice the model size on the filesystem holding the blob store, and three
+    times it when the file has to be uploaded instead of hard-linked.
+    """
+    available = free_bytes(path)
+    if available >= needed:
+        return
+    raise ValueError(
+        f"Not enough disk space for {what}: need {_human_size(needed)} free on "
+        f"{path}, but only {_human_size(available)} is available. Increase the "
+        f"endpoint's container disk, or attach a network volume so models are "
+        f"stored there instead. Registering a GGUF needs roughly 3x the model "
+        f"size at peak because Ollama re-writes the file."
+    )
+
+
+def is_out_of_space(message):
+    return any(
+        marker in (message or "").lower()
+        for marker in ("no space left", "enospc", "disk full", "out of space")
+    )
+
+
+def gpu_total_bytes():
+    """Total VRAM across visible GPUs, or 0 when it can't be determined.
+
+    Ollama exposes no API for this, so shell out to nvidia-smi and treat any
+    failure as "unknown" rather than as "no GPU".
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if out.returncode != 0:
+            return 0
+        return sum(int(line) * (1 << 20) for line in out.stdout.split() if line.strip().isdigit())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def vram_warning(model_bytes, vram_bytes, overhead=1.15):
+    """Message to log when the weights won't comfortably fit in VRAM, else None.
+
+    Deliberately advisory: Ollama offloads whatever doesn't fit to CPU, so the
+    model still answers, just slowly. Failing hard here would break setups that
+    work.
+    """
+    if not model_bytes or not vram_bytes:
+        return None
+    needed = model_bytes * overhead
+    if needed <= vram_bytes:
+        return None
+    return (
+        f"WARN: this model needs about {_human_size(needed)} of VRAM "
+        f"({_human_size(model_bytes)} of weights plus ~{int((overhead - 1) * 100)}% for "
+        f"KV cache and activations) but the worker has {_human_size(vram_bytes)}. "
+        f"Ollama will offload the remainder to CPU, which is much slower. Pick a GPU "
+        f"with more VRAM, a smaller quantization via HF_QUANTIZATION, or a lower "
+        f"OLLAMA_CONTEXT_LENGTH."
+    )
+
+
+def ollama_error(response):
+    """Ollama's reason lives in the response body; the status line says nothing.
+
+    Returns a string combining status and body, or "" when the response is fine.
+    """
+    if response.ok:
+        return ""
+    detail = response.text.strip()
+    try:
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get("error"):
+            detail = str(payload["error"])
+    except ValueError:
+        pass
+    return f"HTTP {response.status_code} from {response.request.path_url}: {detail[:600]}"
+
+
+_described = set()
+
+
+def describe_model(model):
+    """Log what Ollama thinks this model can do, once per process per model.
+
+    The first thing worth knowing when a request is rejected before the model is
+    even loaded. Memoised because it sits on the hot path: without the guard it
+    costs an /api/show round trip and a log line on every single request.
+    """
+    if model in _described:
+        return
+    try:
+        response = session.post(f"{OLLAMA_BASE_URL}/api/show", json={"model": model}, timeout=60)
+        if not response.ok:
+            print(f"WARN: /api/show failed for '{model}': {ollama_error(response)}", flush=True)
+            return
+        info = response.json()
+        template = (info.get("template") or "").strip()
+        details = info.get("details") or {}
+        print(
+            f"Model '{model}': capabilities={info.get('capabilities')} "
+            f"family={details.get('family')} params={details.get('parameter_size')} "
+            f"quant={details.get('quantization_level')} template={'yes' if template else 'NO'}",
+            flush=True,
+        )
+        if not template:
+            print(
+                f"WARN: '{model}' has no chat template embedded in the GGUF. Chat "
+                f"responses may be malformed — set OLLAMA_TEMPLATE, or pass 'template' "
+                f"in the request input.",
+                flush=True,
+            )
+
+        # Size comes from /api/tags, which reports it per model; /api/show does not.
+        size = 0
+        tags = session.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=30)
+        if tags.ok:
+            for entry in tags.json().get("models", []):
+                if entry.get("name") in (model, f"{model}:latest"):
+                    size = entry.get("size") or 0
+        warning = vram_warning(size, gpu_total_bytes())
+        if warning:
+            print(warning, flush=True)
+
+        _described.add(model)
+    except (requests.RequestException, ValueError) as err:
+        print(f"WARN: could not describe '{model}': {err}", flush=True)
 
 
 def get_local_models():
@@ -160,14 +319,42 @@ def _hf_cache_roots():
     return roots
 
 
+def _resolve_repo_folder(root, folder):
+    """Match the cache folder case-insensitively.
+
+    Hugging Face repo ids are case-sensitive but resolve case-insensitively via a
+    307, so 'org/repo-gguf' downloads fine while Runpod's model store prefills
+    under the canonical 'org/Repo-GGUF'. An exact-match-only lookup silently
+    misses the prefilled copy and re-downloads the whole model.
+    """
+    if os.path.isdir(os.path.join(root, folder)):
+        return folder
+    wanted = folder.lower()
+    try:
+        for entry in sorted(os.listdir(root)):
+            if entry.lower() == wanted and os.path.isdir(os.path.join(root, entry)):
+                print(
+                    f"[ModelStore] Matched '{folder}' to '{entry}' (case differs — set "
+                    f"HF_MODEL to the repo's exact casing to avoid this lookup)",
+                    flush=True,
+                )
+                return entry
+    except OSError:
+        pass
+    return None
+
+
 def find_cached_snapshot(repo_id):
     """Locate a Hugging Face hub snapshot dir, as Runpod's model store lays it out."""
     folder = "models--" + repo_id.strip("/").replace("/", "--")
     for root in _hf_cache_roots():
-        snapshots = os.path.join(root, folder, "snapshots")
+        resolved = _resolve_repo_folder(root, folder)
+        if resolved is None:
+            continue
+        snapshots = os.path.join(root, resolved, "snapshots")
         if not os.path.isdir(snapshots):
             continue
-        ref = os.path.join(root, folder, "refs", "main")
+        ref = os.path.join(root, resolved, "refs", "main")
         if os.path.isfile(ref):
             with open(ref) as f:
                 candidate = os.path.join(snapshots, f.read().strip())
@@ -205,6 +392,14 @@ def _human_size(num_bytes):
 
 def _stem(path):
     return re.sub(r"\.gguf$", "", path, flags=re.I)
+
+
+def _quant_pattern(quantization):
+    """Match a quantization token on -, _, . or / boundaries.
+
+    The trailing set deliberately excludes "_" so "Q4" does not match "Q4_K_M".
+    """
+    return re.compile(rf"(?:^|[-_./]){re.escape(quantization.strip())}(?=[-./]|$)", re.I)
 
 
 def _shard_key(path):
@@ -301,19 +496,35 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
             f"Available GGUF files: {ggufs[:20]}"
         )
 
-    groups = group_ggufs(ggufs)
+    # Explicit HF_MODEL_FILE above may name a projector deliberately; automatic
+    # selection must never land on one.
+    candidates = [f for f in ggufs if not NON_MODEL_GGUF_RE.search(os.path.basename(f))]
+    skipped = [f for f in ggufs if f not in candidates]
+    if skipped:
+        print(
+            f"Ignoring {len(skipped)} non-model GGUF file(s) in '{repo_id}': "
+            f"{[os.path.basename(f) for f in skipped]}",
+            flush=True,
+        )
+    if not candidates:
+        raise ValueError(
+            f"'{repo_id}' contains only non-model GGUF files "
+            f"({[os.path.basename(f) for f in skipped]}). These are multimodal "
+            f"projectors or similar sidecars, not language models, so Ollama cannot "
+            f"serve them. Point HF_MODEL at a repo with model weights."
+        )
+
+    groups = group_ggufs(candidates)
 
     if quantization:
-        pattern = re.compile(
-            rf"(?:^|[-_./]){re.escape(quantization)}(?=[-./]|$)", re.I
-        )
+        pattern = _quant_pattern(quantization)
         matches = [g for g in groups if pattern.search(_stem(g[0]))]
         if len(matches) == 1:
             return validate_group(matches[0], repo_id)
         if not matches:
             raise ValueError(
                 f"No GGUF in '{repo_id}' matches HF_QUANTIZATION='{quantization}'. "
-                f"Available quantizations: {available_quants(ggufs)}. "
+                f"Available quantizations: {available_quants(candidates)}. "
                 f"GGUF files: {[g[0] for g in groups][:20]}"
             )
         raise ValueError(
@@ -324,12 +535,29 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
     if len(groups) == 1:
         return validate_group(groups[0], repo_id)
 
-    # No quantization asked for: take the smallest variant, so the default fits
-    # the smallest GPU and the shortest cold start.
-    if sizes:
-        def group_size(group):
-            return sum(sizes.get(path, 0) for path in group)
+    def group_size(group):
+        return sum((sizes or {}).get(path, 0) for path in group)
 
+    # No quantization asked for. Prefer Q4_K_M, which is what Ollama's own puller
+    # picks and what model cards assume; fall back to the smallest variant only
+    # when the repo doesn't ship it.
+    preferred_pattern = _quant_pattern(PREFERRED_QUANT)
+    for group in groups:
+        if preferred_pattern.search(_stem(group[0])):
+            try:
+                chosen = validate_group(group, repo_id)
+            except ValueError:
+                continue
+            print(
+                f"HF_QUANTIZATION not set — defaulting to {PREFERRED_QUANT} in "
+                f"'{repo_id}': {os.path.basename(chosen[0])}"
+                + (f" ({_human_size(group_size(group))})" if sizes else "")
+                + f". Available quantizations: {available_quants(candidates)}",
+                flush=True,
+            )
+            return chosen
+
+    if sizes:
         for group in sorted(groups, key=lambda g: (group_size(g), g[0])):
             if group_size(group) <= 0:
                 continue
@@ -338,10 +566,11 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
             except ValueError:
                 continue  # incomplete split GGUF — try the next size up
             print(
-                f"HF_QUANTIZATION not set — defaulting to the smallest GGUF in "
-                f"'{repo_id}': {os.path.basename(chosen[0])} "
-                f"({_human_size(group_size(group))}). "
-                f"Available quantizations: {available_quants(ggufs)}",
+                f"HF_QUANTIZATION not set and no {PREFERRED_QUANT} in '{repo_id}' — "
+                f"falling back to the smallest GGUF: {os.path.basename(chosen[0])} "
+                f"({_human_size(group_size(group))}). Set HF_QUANTIZATION explicitly "
+                f"if you need a higher-quality quantization. "
+                f"Available quantizations: {available_quants(candidates)}",
                 flush=True,
             )
             return chosen
@@ -399,6 +628,9 @@ def acquire_gguf(repo_id, quantization, model_file):
 
     token = HF_TOKEN or None
     entries = list(list_repo_tree(repo_id, recursive=True, token=token))
+    download_root = os.environ.get("HUGGINGFACE_HUB_CACHE") or os.path.expanduser(
+        "~/.cache/huggingface/hub"
+    )
     available = [e.path for e in entries]
     sizes = {
         e.path: e.size
@@ -406,9 +638,13 @@ def acquire_gguf(repo_id, quantization, model_file):
         if e.path.lower().endswith(".gguf") and getattr(e, "size", None)
     }
     selected = select_gguf(available, quantization, model_file, repo_id, sizes)
+    wanted = sum(sizes.get(rel, 0) for rel in selected)
+    if wanted:
+        require_free_space(download_root, wanted, f"downloading {repo_id}")
+
     paths = []
     for rel in selected:
-        print(f"Downloading {repo_id}/{rel}", flush=True)
+        print(f"Downloading {repo_id}/{rel} ({_human_size(sizes.get(rel, 0))})", flush=True)
         paths.append(os.path.realpath(hf_hub_download(repo_id, rel, token=token)))
     return paths
 
@@ -435,7 +671,9 @@ def link_blob(path, digest):
     """
     blobs_dir = os.path.join(OLLAMA_MODELS_DIR, "blobs")
     final = os.path.join(blobs_dir, digest.replace(":", "-"))
-    temp = final + ".link"
+    # Unique per attempt: several cold workers can share one network volume, and a
+    # fixed temp name lets them delete each other's in-flight file.
+    temp = f"{final}.{os.getpid()}.{uuid.uuid4().hex[:8]}.link"
     try:
         os.makedirs(blobs_dir, exist_ok=True)
         if os.path.lexists(temp):
@@ -458,31 +696,23 @@ def upload_blob(path, digest):
     response.raise_for_status()
 
 
-def warn_if_no_template(model):
-    """A GGUF without an embedded chat template yields plausible-looking but
-    malformed chat output, which a smoke test happily passes."""
-    try:
-        response = session.post(f"{OLLAMA_BASE_URL}/api/show", json={"model": model}, timeout=60)
-        response.raise_for_status()
-        if not (response.json().get("template") or "").strip():
-            print(
-                f"WARN: '{model}' has no chat template embedded in the GGUF. Chat "
-                f"responses may be malformed — set OLLAMA_TEMPLATE, or pass 'template' "
-                f"in the request input.",
-                flush=True,
-            )
-    except (requests.RequestException, ValueError):
-        pass
-
-
 def create_model_from_gguf(model, paths):
     """Register local GGUF file(s) with Ollama under `model`."""
+    total = sum(os.path.getsize(p) for p in paths)
     files = {}
     for path in paths:
         digest = file_digest(path)
-        if not blob_present(digest) and not link_blob(path, digest):
-            upload_blob(path, digest)
+        linked = True
+        if not blob_present(digest):
+            linked = link_blob(path, digest)
+            if not linked:
+                # Cross-filesystem: the bytes get uploaded as well as re-written.
+                require_free_space(OLLAMA_MODELS_DIR, total * 3, f"registering '{model}'")
+                upload_blob(path, digest)
         files[os.path.basename(path)] = digest
+
+    # Ollama writes a COPY temp plus the final blob, so ~2x on top of the link.
+    require_free_space(OLLAMA_MODELS_DIR, total * 2, f"registering '{model}'")
 
     payload = {"model": model, "files": files, "stream": False}
     if OLLAMA_TEMPLATE:
@@ -505,9 +735,16 @@ def create_model_from_gguf(model, paths):
         if isinstance(event, dict) and event.get("error"):
             error = event["error"]
     if error:
+        if is_out_of_space(error):
+            raise ValueError(
+                f"Out of disk space registering '{model}': {error}. Ollama re-writes "
+                f"the GGUF when importing it, so this needs roughly 3x the model size "
+                f"({_human_size(total * 3)} for this model) at peak. Increase the "
+                f"endpoint's container disk, or attach a network volume."
+            )
         raise ValueError(f"ollama create failed for '{model}': {error}")
 
-    warn_if_no_template(model)
+    describe_model(model)
 
 
 def pull_hf_model_with_token(model):
@@ -544,6 +781,9 @@ def pull_hf_model_with_token(model):
         if os.path.exists(blob_path) and os.path.getsize(blob_path) == layer["size"]:
             continue
         hasher = hashlib.sha256()
+        # Unique per attempt so concurrent workers sharing a volume don't clobber
+        # each other's partial download.
+        partial = f"{blob_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.partial"
         with session.get(
             f"https://huggingface.co/v2/{repo}/blobs/{digest}",
             headers=headers,
@@ -551,14 +791,14 @@ def pull_hf_model_with_token(model):
             timeout=3600,
         ) as blob_response:
             blob_response.raise_for_status()
-            with open(blob_path + ".partial", "wb") as f:
+            with open(partial, "wb") as f:
                 for chunk in blob_response.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
                     hasher.update(chunk)
         if f"sha256:{hasher.hexdigest()}" != digest:
-            os.remove(blob_path + ".partial")
+            os.remove(partial)
             raise ValueError(f"Digest mismatch downloading blob {digest} for {model}")
-        os.replace(blob_path + ".partial", blob_path)
+        os.replace(partial, blob_path)
 
     with open(os.path.join(manifest_dir, tag), "w") as f:
         json.dump(manifest, f)
@@ -577,7 +817,12 @@ def ensure_model(model):
         json={"model": model, "stream": False},
         timeout=3600,
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise ValueError(
+            f"ollama pull failed for '{model}': {ollama_error(response)}. If this is a "
+            f"Hugging Face repo id, set it as HF_MODEL on the endpoint instead of passing "
+            f"it as 'model', or reference it as 'hf.co/<org>/<repo>:<quant>'."
+        )
 
 
 def ensure_default_model():
@@ -592,6 +837,7 @@ def ensure_default_model():
     local = get_local_models()
     if model in local or f"{model}:latest" in local:
         print(f"Model already present: {model}", flush=True)
+        describe_model(model)
         return model
     if HF_MODEL:
         if HF_MODEL != HF_MODEL_RAW or HF_QUANTIZATION != HF_QUANTIZATION_RAW:
@@ -652,14 +898,18 @@ def handler(job):
     try:
         if stream:
             with session.post(endpoint, json=payload, stream=True, timeout=3600) as response:
-                response.raise_for_status()
+                if not response.ok:
+                    yield {"error": f"Ollama request failed: {ollama_error(response)}"}
+                    return
                 for line in response.iter_lines():
                     if not line:
                         continue
                     yield line.decode("utf-8")
         else:
             response = session.post(endpoint, json=payload, timeout=3600)
-            response.raise_for_status()
+            if not response.ok:
+                yield {"error": f"Ollama request failed: {ollama_error(response)}"}
+                return
             yield response.json()
     except requests.RequestException as err:
         yield {"error": f"Ollama request failed: {err}"}

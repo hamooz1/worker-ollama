@@ -7,7 +7,10 @@ real hardware.
     python3 -m pytest test_selection.py -v
 """
 
+import os
+import pathlib
 import sys
+import tempfile
 import types
 
 import pytest
@@ -86,10 +89,10 @@ def test_unknown_quant_lists_what_is_available():
     assert "Q4_K_M" in str(err.value) and "Q8_0" in str(err.value)
 
 
-def test_multiple_ggufs_without_quant_or_sizes_is_an_error():
-    """Without sizes the smallest can't be identified, so the user has to choose."""
+def test_ambiguous_without_quant_sizes_or_preferred_quant_is_an_error():
+    """No Q4_K_M to prefer and no sizes to rank by, so the user has to choose."""
     with pytest.raises(ValueError, match="set HF_QUANTIZATION"):
-        handler.select_gguf(MULTI, "", "", "r/x")
+        handler.select_gguf(["m-IQ1_S.gguf", "m-Q8_0.gguf"], "", "", "r/x")
 
 
 # --- select_gguf: smallest-quantization default -------------------------------
@@ -101,10 +104,30 @@ MULTI_SIZES = {
 }
 
 
-def test_no_quant_defaults_to_smallest():
+def test_no_quant_prefers_q4_k_m_over_the_smallest():
+    """Q4_K_M is Ollama's own default; the smallest is often a 1-bit quant."""
     assert handler.select_gguf(MULTI, "", "", "r/x", MULTI_SIZES) == [
-        "Qwen3-0.6B-Q4_K_S.gguf"
+        "Qwen3-0.6B-Q4_K_M.gguf"
     ]
+
+
+def test_no_quant_falls_back_to_smallest_without_q4_k_m():
+    files = {"m-IQ1_S.gguf": 200, "m-Q8_0.gguf": 900}
+    assert handler.select_gguf(list(files), "", "", "r/x", files) == ["m-IQ1_S.gguf"]
+
+
+def test_preferred_quant_wins_even_when_much_larger():
+    """unsloth/Qwen3-8B-GGUF shape: IQ1_S is less than half the size of Q4_K_M."""
+    files = {"Qwen3-8B-UD-IQ1_S.gguf": int(2.28e9), "Qwen3-8B-Q4_K_M.gguf": int(5.03e9),
+             "Qwen3-8B-Q8_0.gguf": int(8.7e9)}
+    assert handler.select_gguf(list(files), "", "", "unsloth/Qwen3-8B-GGUF", files) == [
+        "Qwen3-8B-Q4_K_M.gguf"
+    ]
+
+
+def test_preferred_quant_needs_no_sizes():
+    files = ["m-IQ1_S.gguf", "m-Q4_K_M.gguf"]
+    assert handler.select_gguf(files, "", "", "r/x") == ["m-Q4_K_M.gguf"]
 
 
 def test_explicit_quant_still_beats_the_smallest_default():
@@ -269,6 +292,190 @@ def test_derive_model_name_is_lowercase():
 
 
 # --- normalize_model_name -----------------------------------------------------
+
+
+# --- VRAM advisory ------------------------------------------------------------
+
+
+def test_vram_warning_silent_when_it_fits():
+    assert handler.vram_warning(8 << 30, 24 << 30) is None
+
+
+def test_vram_warning_fires_when_weights_exceed_vram():
+    msg = handler.vram_warning(22 << 30, 24 << 30)  # 22 GiB * 1.15 > 24 GiB
+    assert msg and "offload the remainder to CPU" in msg
+    assert "HF_QUANTIZATION" in msg and "OLLAMA_CONTEXT_LENGTH" in msg
+
+
+def test_vram_warning_silent_when_vram_is_unknown():
+    """nvidia-smi missing must not produce a scary message."""
+    assert handler.vram_warning(40 << 30, 0) is None
+    assert handler.vram_warning(0, 24 << 30) is None
+
+
+def test_vram_warning_is_advisory_not_an_exception():
+    assert isinstance(handler.vram_warning(40 << 30, 24 << 30), str)
+
+
+# --- concurrency: temp names must be unique per attempt -----------------------
+
+
+def test_blob_temp_names_are_unique_per_attempt(monkeypatch, tmp_path):
+    """Several cold workers can share one network volume; a fixed temp name lets
+    them delete each other's in-flight file."""
+    seen = set()
+    monkeypatch.setattr(handler, "OLLAMA_MODELS_DIR", str(tmp_path))
+    src = tmp_path / "src.gguf"
+    src.write_bytes(b"x" * 16)
+
+    real_link = os.link
+
+    def capture(a, b):
+        seen.add(b)
+        return real_link(a, b)
+
+    monkeypatch.setattr(os, "link", capture)
+    for _ in range(5):
+        digest = "sha256:" + "a" * 64
+        handler.link_blob(str(src), digest)
+        os.remove(os.path.join(str(tmp_path), "blobs", digest.replace(":", "-")))
+    assert len(seen) == 5, f"temp names collided: {seen}"
+
+
+# --- disk guards --------------------------------------------------------------
+
+
+def test_is_out_of_space_recognises_ollama_wording():
+    assert handler.is_out_of_space("write blob: no space left on device")
+    assert handler.is_out_of_space("ENOSPC")
+    assert not handler.is_out_of_space("unsupported architecture \"ornith\"")
+
+
+def test_require_free_space_passes_when_there_is_room(tmp_path):
+    handler.require_free_space(str(tmp_path), 1024, "a tiny thing")
+
+
+def test_require_free_space_errors_actionably(tmp_path):
+    with pytest.raises(ValueError) as err:
+        handler.require_free_space(str(tmp_path), 1 << 60, "registering 'x'")
+    message = str(err.value)
+    assert "Not enough disk space" in message
+    assert "container disk" in message and "network volume" in message
+
+
+def test_free_bytes_walks_up_to_an_existing_parent(tmp_path):
+    missing = tmp_path / "does" / "not" / "exist"
+    assert handler.free_bytes(str(missing)) > 0
+
+
+# --- case-insensitive model store lookup -------------------------------------
+
+
+def _fs_is_case_sensitive(tmp_path):
+    probe = tmp_path / "CaseProbe"
+    probe.mkdir()
+    return not (tmp_path / "caseprobe").exists()
+
+
+# On a case-insensitive filesystem (macOS APFS) the exact-match branch already
+# succeeds, so the fallback scan is unreachable. The worker runs on Linux, where
+# it is reachable and load-bearing, so cover it there rather than asserting
+# behaviour the local filesystem cannot produce.
+case_sensitive_only = pytest.mark.skipif(
+    not _fs_is_case_sensitive(pathlib.Path(tempfile.mkdtemp())),
+    reason="filesystem is case-insensitive; the fallback scan cannot be exercised here",
+)
+
+
+@case_sensitive_only
+def test_model_store_folder_matched_case_insensitively(tmp_path, capsys):
+    """Runpod prefills under the canonical casing; HF_MODEL may be lowercased."""
+    canonical = tmp_path / "models--ornith-ai--Ornith-1.5-35B-A3B-GGUF"
+    (canonical / "snapshots" / "abc123").mkdir(parents=True)
+    (canonical / "refs").mkdir()
+    (canonical / "refs" / "main").write_text("abc123")
+
+    wanted = "models--ornith-ai--ornith-1.5-35b-a3b-gguf"
+    assert handler._resolve_repo_folder(str(tmp_path), wanted) == canonical.name
+    assert "case differs" in capsys.readouterr().out
+
+
+def test_model_store_folder_exact_match_is_preferred(tmp_path):
+    exact = tmp_path / "models--org--Repo"
+    exact.mkdir()
+    assert handler._resolve_repo_folder(str(tmp_path), exact.name) == exact.name
+
+
+def test_model_store_folder_missing_returns_none(tmp_path):
+    assert handler._resolve_repo_folder(str(tmp_path), "models--nope--nope") is None
+
+
+@case_sensitive_only
+def test_find_cached_snapshot_uses_case_insensitive_match(tmp_path, monkeypatch):
+    canonical = tmp_path / "models--ornith-ai--Ornith-1.5-35B-A3B-GGUF"
+    snap = canonical / "snapshots" / "deadbeef"
+    snap.mkdir(parents=True)
+    (canonical / "refs").mkdir()
+    (canonical / "refs" / "main").write_text("deadbeef")
+    monkeypatch.setattr(handler, "RUNPOD_MODEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    assert handler.find_cached_snapshot("ornith-ai/ornith-1.5-35b-a3b-gguf") == str(snap)
+
+
+# --- non-model GGUFs (multimodal projectors) must never be auto-selected -------
+
+# The real listing of ornith-ai/Ornith-1.5-35B-A3B-GGUF. The projector is the
+# smallest file in the repo, so a naive smallest-wins default picks it and every
+# request then fails with an immediate 400 from Ollama.
+ORNITH = {
+    "mmproj-Ornith-1.5-35B-BF16.gguf": int(0.90e9),
+    "Ornith-1.5-35B-Q4_K_M.gguf": int(21.71e9),
+    "Ornith-1.5-35B-Q5_K_M.gguf": int(25.35e9),
+    "Ornith-1.5-35B-Q6_K.gguf": int(29.21e9),
+    "Ornith-1.5-35B-Q8_0.gguf": int(37.80e9),
+    "Ornith-1.5-35B-BF16.gguf": int(71.07e9),
+}
+
+
+def test_smallest_default_skips_the_multimodal_projector():
+    assert handler.select_gguf(list(ORNITH), "", "", "ornith-ai/x", ORNITH) == [
+        "Ornith-1.5-35B-Q4_K_M.gguf"
+    ]
+
+
+def test_projector_is_not_matched_by_quantization():
+    """BF16 must resolve to the model, not to mmproj-...-BF16.gguf."""
+    assert handler.select_gguf(list(ORNITH), "BF16", "", "ornith-ai/x", ORNITH) == [
+        "Ornith-1.5-35B-BF16.gguf"
+    ]
+
+
+def test_projector_only_repo_fails_with_a_clear_error():
+    files = {"mmproj-model-BF16.gguf": 900}
+    with pytest.raises(ValueError, match="only non-model GGUF"):
+        handler.select_gguf(list(files), "", "", "r/x", files)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["mmproj-model-BF16.gguf", "mmproj.gguf", "model-mmproj-f16.gguf",
+     "model.mm-proj.gguf", "model-projector.gguf"],
+)
+def test_non_model_gguf_names_are_recognised(name):
+    assert handler.NON_MODEL_GGUF_RE.search(name)
+
+
+@pytest.mark.parametrize("name", ["Ornith-1.5-35B-Q4_K_M.gguf", "model-Q8_0.gguf"])
+def test_real_model_names_are_not_mistaken_for_sidecars(name):
+    assert not handler.NON_MODEL_GGUF_RE.search(name)
+
+
+def test_projector_can_still_be_named_explicitly():
+    """HF_MODEL_FILE is an explicit instruction, so it is honoured."""
+    assert handler.select_gguf(
+        list(ORNITH), "", "mmproj-Ornith-1.5-35B-BF16.gguf", "ornith-ai/x", ORNITH
+    ) == ["mmproj-Ornith-1.5-35B-BF16.gguf"]
 
 
 # --- parse_hf_model: every shape HF_MODEL arrives in --------------------------

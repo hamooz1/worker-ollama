@@ -1,6 +1,28 @@
 {
   "tests": [
     {
+      "name": "hf_gguf_default_chat",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with exactly one word: hello"
+          }
+        ]
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "hf_gguf_default_prompt",
+      "input": {
+        "prompt": "Say hello in one word.",
+        "options": {
+          "num_predict": 10
+        }
+      },
+      "timeout": 300000
+    },
+    {
       "name": "chat_completion",
       "input": {
         "model": "smollm2:135m",
@@ -43,28 +65,6 @@
         "options": {
           "num_predict": 10,
           "temperature": 0
-        }
-      },
-      "timeout": 300000
-    },
-    {
-      "name": "hf_gguf_default_chat",
-      "input": {
-        "messages": [
-          {
-            "role": "user",
-            "content": "Reply with exactly one word: hello"
-          }
-        ]
-      },
-      "timeout": 300000
-    },
-    {
-      "name": "hf_gguf_default_prompt",
-      "input": {
-        "prompt": "Say hello in one word.",
-        "options": {
-          "num_predict": 10
         }
       },
       "timeout": 300000
