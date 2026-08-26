@@ -3,13 +3,73 @@ set -e
 
 echo "Starting Runpod Ollama worker..."
 
-# Cache models on the network volume when one is attached, so warm workers
-# and restarts skip the pull entirely.
-if [ -d "/runpod-volume" ]; then
-    export OLLAMA_MODELS="/runpod-volume/ollama/models"
-    mkdir -p "$OLLAMA_MODELS"
-    echo "Network volume detected — caching models at $OLLAMA_MODELS"
+# Runpod's model store mounts at /runpod-volume even when no network volume is
+# attached, and that mount is not documented as writable — so probe rather than
+# assume. Only ever used inside `if`, so `set -e` won't kill the script.
+writable() {
+    mkdir -p "$1" 2>/dev/null && touch "$1/.rw-probe" 2>/dev/null && rm -f "$1/.rw-probe" 2>/dev/null
+}
+
+VOLUME_ROOT="/runpod-volume"
+
+# From inside the worker there is no way to tell a network volume from a local
+# volume disk from a model-store mount — they all appear at the same path. So
+# report what is actually observable (present / writable) and say what that does
+# and doesn't imply.
+VOLUME_STATE="absent"
+if [ -d "$VOLUME_ROOT" ]; then
+    if writable "$VOLUME_ROOT/ollama"; then
+        VOLUME_STATE="writable"
+    else
+        VOLUME_STATE="read-only"
+    fi
 fi
+
+export RUNPOD_MODEL_CACHE_DIR="${RUNPOD_MODEL_CACHE_DIR:-$VOLUME_ROOT/huggingface-cache/hub}"
+
+case "$VOLUME_STATE" in
+    writable)
+        echo "Volume: $VOLUME_ROOT present and writable — network volume or local volume disk (indistinguishable from here). Models cached here only survive across workers if it is a network volume."
+        ;;
+    read-only)
+        echo "Volume: $VOLUME_ROOT present but NOT writable — likely a model-store mount only. Caches will go to container disk and will not be reused by the next worker."
+        ;;
+    absent)
+        echo "Volume: no $VOLUME_ROOT — using container disk. Attach a network volume to reuse models across workers."
+        ;;
+esac
+
+if [ -d "$RUNPOD_MODEL_CACHE_DIR" ]; then
+    echo "Model store: $RUNPOD_MODEL_CACHE_DIR present (Runpod pre-downloaded cache)"
+else
+    echo "Model store: $RUNPOD_MODEL_CACHE_DIR not found — set the endpoint's Model field to a Hugging Face repo to use it"
+fi
+
+# Ollama's own store: everything it pulls lands here, including plain Ollama
+# library models and gated hf.co pulls, not just model-store models.
+if [ -z "$OLLAMA_MODELS" ]; then
+    if [ "$VOLUME_STATE" = "writable" ]; then
+        export OLLAMA_MODELS="$VOLUME_ROOT/ollama/models"
+    else
+        export OLLAMA_MODELS="/root/.ollama/models"
+    fi
+fi
+mkdir -p "$OLLAMA_MODELS" 2>/dev/null || echo "WARN: cannot create $OLLAMA_MODELS"
+
+# Fallback downloads use the same layout as the model store, so on a writable
+# volume they persist and the same resolver finds them on the next cold start.
+if [ -z "$HUGGINGFACE_HUB_CACHE" ]; then
+    if [ "$VOLUME_STATE" = "writable" ]; then
+        export HUGGINGFACE_HUB_CACHE="$VOLUME_ROOT/huggingface-cache/hub"
+    else
+        export HUGGINGFACE_HUB_CACHE="/root/.cache/huggingface/hub"
+    fi
+fi
+export HF_HUB_CACHE="$HUGGINGFACE_HUB_CACHE"
+mkdir -p "$HUGGINGFACE_HUB_CACHE" 2>/dev/null || true
+
+echo "Ollama store: $OLLAMA_MODELS"
+echo "HF cache — read: $RUNPOD_MODEL_CACHE_DIR | write: $HUGGINGFACE_HUB_CACHE"
 
 ollama serve &
 
@@ -19,14 +79,21 @@ until curl -sf http://127.0.0.1:11434/api/version > /dev/null; do
 done
 echo "Ollama server is ready"
 
-if [ -n "$OLLAMA_MODEL" ]; then
-    echo "Pulling model: $OLLAMA_MODEL"
-    # ensure_model uses HF_TOKEN for gated hf.co models, ollama pull otherwise
-    if /opt/venv/bin/python -c 'import os, handler; handler.ensure_model(os.environ["OLLAMA_MODEL"])'; then
-        echo "Model pulled: $OLLAMA_MODEL"
-    else
-        echo "WARN: startup pull of $OLLAMA_MODEL failed — handler will retry on first request"
-    fi
+if [ -n "$HF_MODEL" ]; then
+    echo "Preparing Hugging Face model: $HF_MODEL (HF_MODEL takes precedence — OLLAMA_MODEL='$OLLAMA_MODEL' is ignored)"
+elif [ -n "$OLLAMA_MODEL" ]; then
+    echo "Preparing Ollama model: $OLLAMA_MODEL"
+else
+    echo "Neither HF_MODEL nor OLLAMA_MODEL is set — falling back to the worker's default Ollama model"
+fi
+
+# Always runs: resolve_default_model has a fallback, so there is always a model to
+# prepare. ensure_default_model resolves HF_MODEL over OLLAMA_MODEL, reads Runpod's
+# model store first, and uses HF_TOKEN for gated repos.
+if /opt/venv/bin/python -c 'import handler; print("Model ready:", handler.ensure_default_model())'; then
+    :
+else
+    echo "WARN: startup model preparation failed — the handler will retry on the first request"
 fi
 
 cd /

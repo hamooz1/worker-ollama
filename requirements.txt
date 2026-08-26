@@ -1,2 +1,4 @@
 runpod~=1.7
 requests~=2.32
+huggingface_hub~=0.35
+hf_transfer~=0.1

@@ -3,7 +3,7 @@
     {
       "name": "chat_completion",
       "input": {
-        "model": "llama3.2:1b",
+        "model": "smollm2:135m",
         "messages": [
           {
             "role": "user",
@@ -16,7 +16,7 @@
     {
       "name": "prompt_completion",
       "input": {
-        "model": "llama3.2:1b",
+        "model": "smollm2:135m",
         "prompt": "Say hello in one word."
       },
       "timeout": 300000
@@ -24,7 +24,7 @@
     {
       "name": "streaming_chat",
       "input": {
-        "model": "llama3.2:1b",
+        "model": "smollm2:135m",
         "messages": [
           {
             "role": "user",
@@ -38,11 +38,33 @@
     {
       "name": "options_passthrough",
       "input": {
-        "model": "llama3.2:1b",
+        "model": "smollm2:135m",
         "prompt": "Write a long story about a dragon.",
         "options": {
           "num_predict": 10,
           "temperature": 0
+        }
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "hf_gguf_default_chat",
+      "input": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Reply with exactly one word: hello"
+          }
+        ]
+      },
+      "timeout": 300000
+    },
+    {
+      "name": "hf_gguf_default_prompt",
+      "input": {
+        "prompt": "Say hello in one word.",
+        "options": {
+          "num_predict": 10
         }
       },
       "timeout": 300000
@@ -53,8 +75,12 @@
     "gpuCount": 1,
     "env": [
       {
+        "key": "HF_MODEL",
+        "value": "unsloth/SmolLM2-135M-Instruct-GGUF"
+      },
+      {
         "key": "OLLAMA_MODEL",
-        "value": "llama3.2:1b"
+        "value": "smollm2:135m"
       },
       {
         "key": "OLLAMA_FLASH_ATTENTION",
