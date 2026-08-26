@@ -46,6 +46,9 @@ HF_MODEL        = unsloth/Qwen3-8B-GGUF
 HF_QUANTIZATION = Q4_K_M
 ```
 
+> [!TIP]
+> **Use the repo's exact casing.** Hugging Face resolves a lowercased repo id with a `307` redirect, so downloads work either way — but Runpod's model store prefills under the canonical casing. The worker falls back to a case-insensitive lookup and logs when it has to, though matching the casing yourself avoids the scan entirely.
+
 If you omit `HF_QUANTIZATION` and the repo id carries no `:<quant>` tag, the worker picks the **smallest** GGUF in the repo — fastest to download and load, lowest quality — and logs which one it chose:
 
 ```
@@ -175,11 +178,18 @@ Non-streaming responses return Ollama's native response object:
 
 | Configuration | Ollama store | GGUF acquisition | Disk needed |
 |---|---|---|---|
-| Writable network volume (**recommended**) | `/runpod-volume/ollama/models` | hard-linked from the cache, no copy | image only, plus ~2× model on the volume |
-| Model store, no network volume | `/root/.ollama/models` | copied (different filesystem) | ~2× model + ~5 GB image |
-| Neither | `/root/.ollama/models` | downloaded, then hard-linked | ~2× model + ~5 GB image |
+| Writable network volume (**recommended**) | `/runpod-volume/ollama/models` | hard-linked from the cache, no copy | image only, plus ~3× model on the volume |
+| Model store, no network volume | `/root/.ollama/models` | copied (different filesystem) | ~3× model + ~5 GB image |
+| Neither | `/root/.ollama/models` | downloaded, then hard-linked | ~3× model + ~5 GB image |
 
-Ollama re-writes a GGUF when registering it (you'll see `validating GGUF model` in the log), so budget roughly **2× the model size**. Where possible the worker hard-links the GGUF into Ollama's blob store rather than uploading it, which avoids a third copy.
+> [!IMPORTANT]
+> **Budget ~3× the model size at peak.** Ollama re-writes a GGUF when registering it (`validating GGUF model` in the log), so at peak the blob store holds the hard-linked original, a `COPY` temp, and the final blob at once. Measured on a real import: **2.49× sampled, up to 3× transient**, settling to 2× afterwards.
+>
+> A 20 GiB model therefore needs ~64 GiB free, which is why the default container disk is **100 GB**. The worker now fails fast with the required and available figures instead of letting Ollama die with an opaque 500 after writing 20 GiB.
+
+Where possible the worker hard-links the GGUF into Ollama's blob store rather than uploading it through localhost HTTP, which removes one full copy from the peak.
+
+If you need 1× disk instead, skip the Hugging Face path and use Ollama's native puller — `OLLAMA_MODEL=hf.co/<org>/<repo>:<quant>` fetches pre-built layers with no re-write. You lose model-store caching in exchange.
 
 A writable network volume is what makes cold starts fast: the registered model persists there, so later workers skip the download, the hashing and the registration entirely.
 
@@ -198,6 +208,7 @@ If `/runpod-volume` exists but isn't writable — a model-store mount with no vo
 ## Limitations
 
 - **GGUF only.** Safetensors-only Hugging Face repos are rejected with an error — use a GGUF conversion of the model.
+- **Multimodal projectors are skipped.** A repo shipping `mmproj-*.gguf` alongside the model has that file excluded from automatic selection, since it holds no language-model weights and Ollama rejects every request against it. Vision input is therefore not wired up; the language model is served text-only.
 - **One cached model per endpoint**, and the model store downloads every quantization in the repo.
 - A GGUF with no embedded chat template produces malformed chat output. Set `OLLAMA_TEMPLATE`, or pass `template` per request. The worker logs a warning when it detects this.
 

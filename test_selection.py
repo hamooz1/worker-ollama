@@ -7,7 +7,9 @@ real hardware.
     python3 -m pytest test_selection.py -v
 """
 
+import pathlib
 import sys
+import tempfile
 import types
 
 import pytest
@@ -269,6 +271,142 @@ def test_derive_model_name_is_lowercase():
 
 
 # --- normalize_model_name -----------------------------------------------------
+
+
+# --- disk guards --------------------------------------------------------------
+
+
+def test_is_out_of_space_recognises_ollama_wording():
+    assert handler.is_out_of_space("write blob: no space left on device")
+    assert handler.is_out_of_space("ENOSPC")
+    assert not handler.is_out_of_space("unsupported architecture \"ornith\"")
+
+
+def test_require_free_space_passes_when_there_is_room(tmp_path):
+    handler.require_free_space(str(tmp_path), 1024, "a tiny thing")
+
+
+def test_require_free_space_errors_actionably(tmp_path):
+    with pytest.raises(ValueError) as err:
+        handler.require_free_space(str(tmp_path), 1 << 60, "registering 'x'")
+    message = str(err.value)
+    assert "Not enough disk space" in message
+    assert "container disk" in message and "network volume" in message
+
+
+def test_free_bytes_walks_up_to_an_existing_parent(tmp_path):
+    missing = tmp_path / "does" / "not" / "exist"
+    assert handler.free_bytes(str(missing)) > 0
+
+
+# --- case-insensitive model store lookup -------------------------------------
+
+
+def _fs_is_case_sensitive(tmp_path):
+    probe = tmp_path / "CaseProbe"
+    probe.mkdir()
+    return not (tmp_path / "caseprobe").exists()
+
+
+# On a case-insensitive filesystem (macOS APFS) the exact-match branch already
+# succeeds, so the fallback scan is unreachable. The worker runs on Linux, where
+# it is reachable and load-bearing, so cover it there rather than asserting
+# behaviour the local filesystem cannot produce.
+case_sensitive_only = pytest.mark.skipif(
+    not _fs_is_case_sensitive(pathlib.Path(tempfile.mkdtemp())),
+    reason="filesystem is case-insensitive; the fallback scan cannot be exercised here",
+)
+
+
+@case_sensitive_only
+def test_model_store_folder_matched_case_insensitively(tmp_path, capsys):
+    """Runpod prefills under the canonical casing; HF_MODEL may be lowercased."""
+    canonical = tmp_path / "models--ornith-ai--Ornith-1.5-35B-A3B-GGUF"
+    (canonical / "snapshots" / "abc123").mkdir(parents=True)
+    (canonical / "refs").mkdir()
+    (canonical / "refs" / "main").write_text("abc123")
+
+    wanted = "models--ornith-ai--ornith-1.5-35b-a3b-gguf"
+    assert handler._resolve_repo_folder(str(tmp_path), wanted) == canonical.name
+    assert "case differs" in capsys.readouterr().out
+
+
+def test_model_store_folder_exact_match_is_preferred(tmp_path):
+    exact = tmp_path / "models--org--Repo"
+    exact.mkdir()
+    assert handler._resolve_repo_folder(str(tmp_path), exact.name) == exact.name
+
+
+def test_model_store_folder_missing_returns_none(tmp_path):
+    assert handler._resolve_repo_folder(str(tmp_path), "models--nope--nope") is None
+
+
+@case_sensitive_only
+def test_find_cached_snapshot_uses_case_insensitive_match(tmp_path, monkeypatch):
+    canonical = tmp_path / "models--ornith-ai--Ornith-1.5-35B-A3B-GGUF"
+    snap = canonical / "snapshots" / "deadbeef"
+    snap.mkdir(parents=True)
+    (canonical / "refs").mkdir()
+    (canonical / "refs" / "main").write_text("deadbeef")
+    monkeypatch.setattr(handler, "RUNPOD_MODEL_CACHE_DIR", str(tmp_path))
+    monkeypatch.delenv("HUGGINGFACE_HUB_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    assert handler.find_cached_snapshot("ornith-ai/ornith-1.5-35b-a3b-gguf") == str(snap)
+
+
+# --- non-model GGUFs (multimodal projectors) must never be auto-selected -------
+
+# The real listing of ornith-ai/Ornith-1.5-35B-A3B-GGUF. The projector is the
+# smallest file in the repo, so a naive smallest-wins default picks it and every
+# request then fails with an immediate 400 from Ollama.
+ORNITH = {
+    "mmproj-Ornith-1.5-35B-BF16.gguf": int(0.90e9),
+    "Ornith-1.5-35B-Q4_K_M.gguf": int(21.71e9),
+    "Ornith-1.5-35B-Q5_K_M.gguf": int(25.35e9),
+    "Ornith-1.5-35B-Q6_K.gguf": int(29.21e9),
+    "Ornith-1.5-35B-Q8_0.gguf": int(37.80e9),
+    "Ornith-1.5-35B-BF16.gguf": int(71.07e9),
+}
+
+
+def test_smallest_default_skips_the_multimodal_projector():
+    assert handler.select_gguf(list(ORNITH), "", "", "ornith-ai/x", ORNITH) == [
+        "Ornith-1.5-35B-Q4_K_M.gguf"
+    ]
+
+
+def test_projector_is_not_matched_by_quantization():
+    """BF16 must resolve to the model, not to mmproj-...-BF16.gguf."""
+    assert handler.select_gguf(list(ORNITH), "BF16", "", "ornith-ai/x", ORNITH) == [
+        "Ornith-1.5-35B-BF16.gguf"
+    ]
+
+
+def test_projector_only_repo_fails_with_a_clear_error():
+    files = {"mmproj-model-BF16.gguf": 900}
+    with pytest.raises(ValueError, match="only non-model GGUF"):
+        handler.select_gguf(list(files), "", "", "r/x", files)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["mmproj-model-BF16.gguf", "mmproj.gguf", "model-mmproj-f16.gguf",
+     "model.mm-proj.gguf", "model-projector.gguf"],
+)
+def test_non_model_gguf_names_are_recognised(name):
+    assert handler.NON_MODEL_GGUF_RE.search(name)
+
+
+@pytest.mark.parametrize("name", ["Ornith-1.5-35B-Q4_K_M.gguf", "model-Q8_0.gguf"])
+def test_real_model_names_are_not_mistaken_for_sidecars(name):
+    assert not handler.NON_MODEL_GGUF_RE.search(name)
+
+
+def test_projector_can_still_be_named_explicitly():
+    """HF_MODEL_FILE is an explicit instruction, so it is honoured."""
+    assert handler.select_gguf(
+        list(ORNITH), "", "mmproj-Ornith-1.5-35B-BF16.gguf", "ornith-ai/x", ORNITH
+    ) == ["mmproj-Ornith-1.5-35B-BF16.gguf"]
 
 
 # --- parse_hf_model: every shape HF_MODEL arrives in --------------------------
