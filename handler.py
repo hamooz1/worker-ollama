@@ -13,8 +13,8 @@ OLLAMA_MODELS_DIR = os.environ.get("OLLAMA_MODELS", "/root/.ollama/models")
 
 # Hugging Face inputs. These are NOT the same thing as OLLAMA_MODEL: HF_MODEL is a
 # Hugging Face repo id, OLLAMA_MODEL is an Ollama model reference. HF_MODEL wins.
-HF_MODEL = os.environ.get("HF_MODEL", "").strip().strip("/")
-HF_QUANTIZATION = os.environ.get("HF_QUANTIZATION", "").strip()
+HF_MODEL_RAW = os.environ.get("HF_MODEL", "").strip()
+HF_QUANTIZATION_RAW = os.environ.get("HF_QUANTIZATION", "").strip()
 HF_MODEL_FILE = os.environ.get("HF_MODEL_FILE", "").strip()
 # Where Runpod's model store mounts its prefilled Hugging Face cache. There is no
 # env var injected by the platform to discover this, so it is a documented path
@@ -38,6 +38,51 @@ QUANT_RE = re.compile(
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
 
 session = requests.Session()
+
+# Accepted shapes for the repo id, longest prefix first so 'https://hf.co/' is
+# not partially matched by 'hf.co/'.
+HF_REPO_PREFIXES = (
+    "https://huggingface.co/",
+    "http://huggingface.co/",
+    "https://hf.co/",
+    "http://hf.co/",
+    "huggingface.co/",
+    "hf.co/",
+)
+
+
+def parse_hf_model(value):
+    """Split an HF_MODEL value into (repo_id, quantization).
+
+    The Hub's Hugging Face picker stores this as 'hf.co/<org>/<repo>', users
+    paste bare repo ids and browser URLs, and Ollama-style references carry the
+    quantization as a ':tag'. Normalise all of them to a bare 'org/repo', since
+    that is what both the model-store folder name and the HF API expect.
+    """
+    value = (value or "").strip()
+    lowered = value.lower()
+    for prefix in HF_REPO_PREFIXES:
+        if lowered.startswith(prefix):
+            value = value[len(prefix) :]
+            break
+
+    # A Hugging Face repo id can't contain ':', so a colon is always a tag.
+    repo, _, tag = value.partition(":")
+
+    # Keep only '<org>/<repo>', dropping web-UI suffixes like '/tree/main'.
+    parts = [part for part in repo.split("/") if part][:2]
+    repo = "/".join(parts)
+
+    tag = tag.strip().strip("/")
+    if tag.lower() == "latest":
+        tag = ""
+    return repo, tag
+
+
+# Derived here rather than at the top so an 'hf.co/org/repo:Q4_K_M' style value
+# works as well as a bare repo id. An explicit HF_QUANTIZATION still wins.
+HF_MODEL, _HF_MODEL_TAG = parse_hf_model(HF_MODEL_RAW)
+HF_QUANTIZATION = HF_QUANTIZATION_RAW or _HF_MODEL_TAG
 
 
 def get_local_models():
@@ -549,6 +594,12 @@ def ensure_default_model():
         print(f"Model already present: {model}", flush=True)
         return model
     if HF_MODEL:
+        if HF_MODEL != HF_MODEL_RAW or HF_QUANTIZATION != HF_QUANTIZATION_RAW:
+            print(
+                f"Read HF_MODEL='{HF_MODEL_RAW}' as repo '{HF_MODEL}'"
+                + (f", quantization '{HF_QUANTIZATION}'" if HF_QUANTIZATION else ""),
+                flush=True,
+            )
         create_model_from_gguf(model, acquire_gguf(HF_MODEL, HF_QUANTIZATION, HF_MODEL_FILE))
     else:
         ensure_model(model)

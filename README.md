@@ -37,7 +37,7 @@ curl -X POST "https://api.runpod.ai/v2/<ENDPOINT_ID>/runsync" \
 
 | Input | Required | Behaviour |
 |---|---|---|
-| `HF_MODEL` | — | Repo id, e.g. `unsloth/Qwen3-8B-GGUF`. Must contain `.gguf` files; a safetensors-only repo fails with an error listing what was found. |
+| `HF_MODEL` | — | Repo id, e.g. `unsloth/Qwen3-8B-GGUF`. Also accepts `hf.co/<org>/<repo>`, a full `huggingface.co` URL, and a trailing `:<quant>` tag — all normalised to a bare repo id. Must contain `.gguf` files; a safetensors-only repo fails with an error listing what was found. |
 | `HF_QUANTIZATION` | no | Matched against filenames on `-`, `_`, `.` and `/` boundaries, case-insensitive. `Q4_K_M` does not match `Q4_K_S`, and `Q4` does not match `Q4_K_M`. No match or an ambiguous match → error listing every quantization in the repo. **Leave it empty and the smallest GGUF in the repo is used.** |
 | `HF_MODEL_FILE` | no | Exact filename, e.g. `Qwen3-8B-Q4_K_M.gguf`. Overrides `HF_QUANTIZATION`. |
 
@@ -46,7 +46,7 @@ HF_MODEL        = unsloth/Qwen3-8B-GGUF
 HF_QUANTIZATION = Q4_K_M
 ```
 
-If you omit `HF_QUANTIZATION`, the worker picks the **smallest** GGUF in the repo — fastest to download and load, lowest quality — and logs which one it chose:
+If you omit `HF_QUANTIZATION` and the repo id carries no `:<quant>` tag, the worker picks the **smallest** GGUF in the repo — fastest to download and load, lowest quality — and logs which one it chose:
 
 ```
 HF_QUANTIZATION not set — defaulting to the smallest GGUF in 'unsloth/SmolLM2-135M-Instruct-GGUF': SmolLM2-135M-Instruct-Q2_K.gguf (88.0 MiB). Available quantizations: ['F16', 'Q2_K', 'Q3_K_M', 'Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0']
