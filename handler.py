@@ -2,6 +2,8 @@ import hashlib
 import json
 import os
 import re
+import subprocess
+import uuid
 
 import requests
 import runpod
@@ -38,6 +40,11 @@ QUANT_RE = re.compile(
 # usually the *smallest* file in the repo, so a naive "smallest wins" default
 # picks it and every request then fails with an immediate 400.
 NON_MODEL_GGUF_RE = re.compile(r"(?:^|[-_.])(mmproj|mm-proj|projector)", re.I)
+# Ollama's own default when a Hugging Face reference carries no tag, and the
+# quantization model cards assume. Preferred over "smallest" because large repos
+# start at 1-bit quants: unsloth/Qwen3-8B-GGUF's smallest is UD-IQ1_S (2.3 GB)
+# against Q4_K_M's 5.0 GB, and IQ1 output quality is not usable for most work.
+PREFERRED_QUANT = "Q4_K_M"
 # Mirrors Ollama's own splitGGUFNameRe. Matching a different pattern than the
 # server does is how you end up with a silently broken multi-layer manifest.
 SHARD_RE = re.compile(r"^(.*)-(\d{5})-of-(\d{5})\.gguf$", re.I)
@@ -128,6 +135,48 @@ def is_out_of_space(message):
     )
 
 
+def gpu_total_bytes():
+    """Total VRAM across visible GPUs, or 0 when it can't be determined.
+
+    Ollama exposes no API for this, so shell out to nvidia-smi and treat any
+    failure as "unknown" rather than as "no GPU".
+    """
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if out.returncode != 0:
+            return 0
+        return sum(int(line) * (1 << 20) for line in out.stdout.split() if line.strip().isdigit())
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return 0
+
+
+def vram_warning(model_bytes, vram_bytes, overhead=1.15):
+    """Message to log when the weights won't comfortably fit in VRAM, else None.
+
+    Deliberately advisory: Ollama offloads whatever doesn't fit to CPU, so the
+    model still answers, just slowly. Failing hard here would break setups that
+    work.
+    """
+    if not model_bytes or not vram_bytes:
+        return None
+    needed = model_bytes * overhead
+    if needed <= vram_bytes:
+        return None
+    return (
+        f"WARN: this model needs about {_human_size(needed)} of VRAM "
+        f"({_human_size(model_bytes)} of weights plus ~{int((overhead - 1) * 100)}% for "
+        f"KV cache and activations) but the worker has {_human_size(vram_bytes)}. "
+        f"Ollama will offload the remainder to CPU, which is much slower. Pick a GPU "
+        f"with more VRAM, a smaller quantization via HF_QUANTIZATION, or a lower "
+        f"OLLAMA_CONTEXT_LENGTH."
+    )
+
+
 def ollama_error(response):
     """Ollama's reason lives in the response body; the status line says nothing.
 
@@ -145,9 +194,18 @@ def ollama_error(response):
     return f"HTTP {response.status_code} from {response.request.path_url}: {detail[:600]}"
 
 
+_described = set()
+
+
 def describe_model(model):
-    """Log what Ollama thinks this model can do. Cheap, and the first thing worth
-    knowing when a request is rejected before the model is even loaded."""
+    """Log what Ollama thinks this model can do, once per process per model.
+
+    The first thing worth knowing when a request is rejected before the model is
+    even loaded. Memoised because it sits on the hot path: without the guard it
+    costs an /api/show round trip and a log line on every single request.
+    """
+    if model in _described:
+        return
     try:
         response = session.post(f"{OLLAMA_BASE_URL}/api/show", json={"model": model}, timeout=60)
         if not response.ok:
@@ -169,6 +227,19 @@ def describe_model(model):
                 f"in the request input.",
                 flush=True,
             )
+
+        # Size comes from /api/tags, which reports it per model; /api/show does not.
+        size = 0
+        tags = session.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=30)
+        if tags.ok:
+            for entry in tags.json().get("models", []):
+                if entry.get("name") in (model, f"{model}:latest"):
+                    size = entry.get("size") or 0
+        warning = vram_warning(size, gpu_total_bytes())
+        if warning:
+            print(warning, flush=True)
+
+        _described.add(model)
     except (requests.RequestException, ValueError) as err:
         print(f"WARN: could not describe '{model}': {err}", flush=True)
 
@@ -323,6 +394,14 @@ def _stem(path):
     return re.sub(r"\.gguf$", "", path, flags=re.I)
 
 
+def _quant_pattern(quantization):
+    """Match a quantization token on -, _, . or / boundaries.
+
+    The trailing set deliberately excludes "_" so "Q4" does not match "Q4_K_M".
+    """
+    return re.compile(rf"(?:^|[-_./]){re.escape(quantization.strip())}(?=[-./]|$)", re.I)
+
+
 def _shard_key(path):
     match = SHARD_RE.match(os.path.basename(path))
     if not match:
@@ -438,9 +517,7 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
     groups = group_ggufs(candidates)
 
     if quantization:
-        pattern = re.compile(
-            rf"(?:^|[-_./]){re.escape(quantization)}(?=[-./]|$)", re.I
-        )
+        pattern = _quant_pattern(quantization)
         matches = [g for g in groups if pattern.search(_stem(g[0]))]
         if len(matches) == 1:
             return validate_group(matches[0], repo_id)
@@ -458,12 +535,29 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
     if len(groups) == 1:
         return validate_group(groups[0], repo_id)
 
-    # No quantization asked for: take the smallest variant, so the default fits
-    # the smallest GPU and the shortest cold start.
-    if sizes:
-        def group_size(group):
-            return sum(sizes.get(path, 0) for path in group)
+    def group_size(group):
+        return sum((sizes or {}).get(path, 0) for path in group)
 
+    # No quantization asked for. Prefer Q4_K_M, which is what Ollama's own puller
+    # picks and what model cards assume; fall back to the smallest variant only
+    # when the repo doesn't ship it.
+    preferred_pattern = _quant_pattern(PREFERRED_QUANT)
+    for group in groups:
+        if preferred_pattern.search(_stem(group[0])):
+            try:
+                chosen = validate_group(group, repo_id)
+            except ValueError:
+                continue
+            print(
+                f"HF_QUANTIZATION not set — defaulting to {PREFERRED_QUANT} in "
+                f"'{repo_id}': {os.path.basename(chosen[0])}"
+                + (f" ({_human_size(group_size(group))})" if sizes else "")
+                + f". Available quantizations: {available_quants(candidates)}",
+                flush=True,
+            )
+            return chosen
+
+    if sizes:
         for group in sorted(groups, key=lambda g: (group_size(g), g[0])):
             if group_size(group) <= 0:
                 continue
@@ -472,9 +566,10 @@ def select_gguf(files, quantization, model_file, repo_id, sizes=None):
             except ValueError:
                 continue  # incomplete split GGUF — try the next size up
             print(
-                f"HF_QUANTIZATION not set — defaulting to the smallest GGUF in "
-                f"'{repo_id}': {os.path.basename(chosen[0])} "
-                f"({_human_size(group_size(group))}). "
+                f"HF_QUANTIZATION not set and no {PREFERRED_QUANT} in '{repo_id}' — "
+                f"falling back to the smallest GGUF: {os.path.basename(chosen[0])} "
+                f"({_human_size(group_size(group))}). Set HF_QUANTIZATION explicitly "
+                f"if you need a higher-quality quantization. "
                 f"Available quantizations: {available_quants(candidates)}",
                 flush=True,
             )
@@ -576,7 +671,9 @@ def link_blob(path, digest):
     """
     blobs_dir = os.path.join(OLLAMA_MODELS_DIR, "blobs")
     final = os.path.join(blobs_dir, digest.replace(":", "-"))
-    temp = final + ".link"
+    # Unique per attempt: several cold workers can share one network volume, and a
+    # fixed temp name lets them delete each other's in-flight file.
+    temp = f"{final}.{os.getpid()}.{uuid.uuid4().hex[:8]}.link"
     try:
         os.makedirs(blobs_dir, exist_ok=True)
         if os.path.lexists(temp):
@@ -684,6 +781,9 @@ def pull_hf_model_with_token(model):
         if os.path.exists(blob_path) and os.path.getsize(blob_path) == layer["size"]:
             continue
         hasher = hashlib.sha256()
+        # Unique per attempt so concurrent workers sharing a volume don't clobber
+        # each other's partial download.
+        partial = f"{blob_path}.{os.getpid()}.{uuid.uuid4().hex[:8]}.partial"
         with session.get(
             f"https://huggingface.co/v2/{repo}/blobs/{digest}",
             headers=headers,
@@ -691,14 +791,14 @@ def pull_hf_model_with_token(model):
             timeout=3600,
         ) as blob_response:
             blob_response.raise_for_status()
-            with open(blob_path + ".partial", "wb") as f:
+            with open(partial, "wb") as f:
                 for chunk in blob_response.iter_content(chunk_size=1 << 20):
                     f.write(chunk)
                     hasher.update(chunk)
         if f"sha256:{hasher.hexdigest()}" != digest:
-            os.remove(blob_path + ".partial")
+            os.remove(partial)
             raise ValueError(f"Digest mismatch downloading blob {digest} for {model}")
-        os.replace(blob_path + ".partial", blob_path)
+        os.replace(partial, blob_path)
 
     with open(os.path.join(manifest_dir, tag), "w") as f:
         json.dump(manifest, f)

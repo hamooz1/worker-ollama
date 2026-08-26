@@ -49,13 +49,15 @@ HF_QUANTIZATION = Q4_K_M
 > [!TIP]
 > **Use the repo's exact casing.** Hugging Face resolves a lowercased repo id with a `307` redirect, so downloads work either way — but Runpod's model store prefills under the canonical casing. The worker falls back to a case-insensitive lookup and logs when it has to, though matching the casing yourself avoids the scan entirely.
 
-If you omit `HF_QUANTIZATION` and the repo id carries no `:<quant>` tag, the worker picks the **smallest** GGUF in the repo — fastest to download and load, lowest quality — and logs which one it chose:
+If you omit `HF_QUANTIZATION` and the repo id carries no `:<quant>` tag, the worker picks **`Q4_K_M`** — the same default Ollama's own puller uses, and what model cards assume:
 
 ```
-HF_QUANTIZATION not set — defaulting to the smallest GGUF in 'unsloth/SmolLM2-135M-Instruct-GGUF': SmolLM2-135M-Instruct-Q2_K.gguf (88.0 MiB). Available quantizations: ['F16', 'Q2_K', 'Q3_K_M', 'Q4_K_M', 'Q5_K_M', 'Q6_K', 'Q8_0']
+HF_QUANTIZATION not set — defaulting to Q4_K_M in 'unsloth/Qwen3-8B-GGUF': Qwen3-8B-Q4_K_M.gguf (4.7 GiB). Available quantizations: [...]
 ```
 
-Set it explicitly whenever you care about output quality. `Q4_K_M` is the usual default choice.
+Only if the repo has no `Q4_K_M` does it fall back to the smallest file, and it says so. That fallback matters because large repos start very low: `unsloth/Qwen3-8B-GGUF`'s smallest is `UD-IQ1_S` at 2.3 GB against Q4_K_M's 5.0 GB, and 1-bit output is not usable for most work.
+
+Set `HF_QUANTIZATION` explicitly whenever you care about the quality/VRAM trade-off.
 
 The model is registered with Ollama as `hf/<org>-<repo>:<quant>` — for the example above, `hf/unsloth-qwen3-8b-gguf:q4_k_m`. That name shows up in `/api/tags` and can be passed as `input.model` on a request.
 
@@ -211,6 +213,7 @@ If `/runpod-volume` exists but isn't writable — a model-store mount with no vo
 - **Multimodal projectors are skipped.** A repo shipping `mmproj-*.gguf` alongside the model has that file excluded from automatic selection, since it holds no language-model weights and Ollama rejects every request against it. Vision input is therefore not wired up; the language model is served text-only.
 - **One cached model per endpoint**, and the model store downloads every quantization in the repo.
 - A GGUF with no embedded chat template produces malformed chat output. Set `OLLAMA_TEMPLATE`, or pass `template` per request. The worker logs a warning when it detects this.
+- **VRAM is not enforced, only reported.** If the weights don't fit, the worker warns and Ollama offloads the remainder to CPU — the model still answers, much more slowly. Pick a larger GPU, a smaller `HF_QUANTIZATION`, or a lower `OLLAMA_CONTEXT_LENGTH`.
 
 ## Local development
 

@@ -7,6 +7,7 @@ real hardware.
     python3 -m pytest test_selection.py -v
 """
 
+import os
 import pathlib
 import sys
 import tempfile
@@ -88,10 +89,10 @@ def test_unknown_quant_lists_what_is_available():
     assert "Q4_K_M" in str(err.value) and "Q8_0" in str(err.value)
 
 
-def test_multiple_ggufs_without_quant_or_sizes_is_an_error():
-    """Without sizes the smallest can't be identified, so the user has to choose."""
+def test_ambiguous_without_quant_sizes_or_preferred_quant_is_an_error():
+    """No Q4_K_M to prefer and no sizes to rank by, so the user has to choose."""
     with pytest.raises(ValueError, match="set HF_QUANTIZATION"):
-        handler.select_gguf(MULTI, "", "", "r/x")
+        handler.select_gguf(["m-IQ1_S.gguf", "m-Q8_0.gguf"], "", "", "r/x")
 
 
 # --- select_gguf: smallest-quantization default -------------------------------
@@ -103,10 +104,30 @@ MULTI_SIZES = {
 }
 
 
-def test_no_quant_defaults_to_smallest():
+def test_no_quant_prefers_q4_k_m_over_the_smallest():
+    """Q4_K_M is Ollama's own default; the smallest is often a 1-bit quant."""
     assert handler.select_gguf(MULTI, "", "", "r/x", MULTI_SIZES) == [
-        "Qwen3-0.6B-Q4_K_S.gguf"
+        "Qwen3-0.6B-Q4_K_M.gguf"
     ]
+
+
+def test_no_quant_falls_back_to_smallest_without_q4_k_m():
+    files = {"m-IQ1_S.gguf": 200, "m-Q8_0.gguf": 900}
+    assert handler.select_gguf(list(files), "", "", "r/x", files) == ["m-IQ1_S.gguf"]
+
+
+def test_preferred_quant_wins_even_when_much_larger():
+    """unsloth/Qwen3-8B-GGUF shape: IQ1_S is less than half the size of Q4_K_M."""
+    files = {"Qwen3-8B-UD-IQ1_S.gguf": int(2.28e9), "Qwen3-8B-Q4_K_M.gguf": int(5.03e9),
+             "Qwen3-8B-Q8_0.gguf": int(8.7e9)}
+    assert handler.select_gguf(list(files), "", "", "unsloth/Qwen3-8B-GGUF", files) == [
+        "Qwen3-8B-Q4_K_M.gguf"
+    ]
+
+
+def test_preferred_quant_needs_no_sizes():
+    files = ["m-IQ1_S.gguf", "m-Q4_K_M.gguf"]
+    assert handler.select_gguf(files, "", "", "r/x") == ["m-Q4_K_M.gguf"]
 
 
 def test_explicit_quant_still_beats_the_smallest_default():
@@ -271,6 +292,54 @@ def test_derive_model_name_is_lowercase():
 
 
 # --- normalize_model_name -----------------------------------------------------
+
+
+# --- VRAM advisory ------------------------------------------------------------
+
+
+def test_vram_warning_silent_when_it_fits():
+    assert handler.vram_warning(8 << 30, 24 << 30) is None
+
+
+def test_vram_warning_fires_when_weights_exceed_vram():
+    msg = handler.vram_warning(22 << 30, 24 << 30)  # 22 GiB * 1.15 > 24 GiB
+    assert msg and "offload the remainder to CPU" in msg
+    assert "HF_QUANTIZATION" in msg and "OLLAMA_CONTEXT_LENGTH" in msg
+
+
+def test_vram_warning_silent_when_vram_is_unknown():
+    """nvidia-smi missing must not produce a scary message."""
+    assert handler.vram_warning(40 << 30, 0) is None
+    assert handler.vram_warning(0, 24 << 30) is None
+
+
+def test_vram_warning_is_advisory_not_an_exception():
+    assert isinstance(handler.vram_warning(40 << 30, 24 << 30), str)
+
+
+# --- concurrency: temp names must be unique per attempt -----------------------
+
+
+def test_blob_temp_names_are_unique_per_attempt(monkeypatch, tmp_path):
+    """Several cold workers can share one network volume; a fixed temp name lets
+    them delete each other's in-flight file."""
+    seen = set()
+    monkeypatch.setattr(handler, "OLLAMA_MODELS_DIR", str(tmp_path))
+    src = tmp_path / "src.gguf"
+    src.write_bytes(b"x" * 16)
+
+    real_link = os.link
+
+    def capture(a, b):
+        seen.add(b)
+        return real_link(a, b)
+
+    monkeypatch.setattr(os, "link", capture)
+    for _ in range(5):
+        digest = "sha256:" + "a" * 64
+        handler.link_blob(str(src), digest)
+        os.remove(os.path.join(str(tmp_path), "blobs", digest.replace(":", "-")))
+    assert len(seen) == 5, f"temp names collided: {seen}"
 
 
 # --- disk guards --------------------------------------------------------------
